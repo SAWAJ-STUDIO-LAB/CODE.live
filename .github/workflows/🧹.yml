@@ -1,0 +1,113 @@
+name: 🧹
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * *'
+
+permissions:
+  actions: write
+  contents: write
+
+concurrency:
+  group: cleaner-safe-repository
+  cancel-in-progress: true # ⚡ पुराना अटका हुआ रन तुरंत कैंसल होगा और नया रन तुरंत चालू हो जाएगा!
+
+jobs:
+  cleaner_repository:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Pre-flight check
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN_GITHUB }}
+        run: |
+          set -euo pipefail
+          [ -n "$GH_TOKEN" ] || exit 1
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          token: ${{ secrets.TOKEN_GITHUB }}
+          fetch-depth: 0
+
+      - name: Fast Cleanup (Runs, Caches, Artifacts, Releases, Tags)
+        env:
+          GH_TOKEN: ${{ secrets.TOKEN_GITHUB }}
+          CURRENT_RUN: ${{ github.run_id }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          echo "⚡ Fast cleaning started..."
+
+          # 1. Delete workflow runs
+          gh api --paginate "repos/$REPO/actions/runs?per_page=100" \
+            --jq '.workflow_runs[] | select(.status=="completed") | .id' \
+            > /tmp/runs.txt 2>/dev/null || true
+          while read -r RID; do
+            [ -z "$RID" ] || [ "$RID" = "$CURRENT_RUN" ] && continue
+            gh api -X DELETE "repos/$REPO/actions/runs/$RID" >/dev/null 2>&1 || true
+          done < /tmp/runs.txt
+
+          # 2. Delete caches
+          gh cache delete --all < /dev/null >/dev/null 2>&1 || true
+
+          # 3. Delete artifacts
+          gh api --paginate "repos/$REPO/actions/artifacts?per_page=100" \
+            --jq '.artifacts[].id' > /tmp/artifacts.txt 2>/dev/null || true
+          while read -r AID; do
+            [ -z "$AID" ] && continue
+            gh api -X DELETE "repos/$REPO/actions/artifacts/$AID" >/dev/null 2>&1 || true
+          done < /tmp/artifacts.txt
+
+          # 4. Delete releases
+          gh api --paginate "repos/$REPO/releases" --jq '.[].id' > /tmp/releases.txt 2>/dev/null || true
+          while read -r REL_ID; do
+            [ -z "$REL_ID" ] && continue
+            gh api -X DELETE "repos/$REPO/releases/$REL_ID" >/dev/null 2>&1 || true
+          done < /tmp/releases.txt
+
+          # 5. Delete tags
+          git fetch --tags --force >/dev/null 2>&1 || true
+          while read -r t; do
+            [ -z "$t" ] && continue
+            git tag -d "$t" >/dev/null 2>&1 || true
+            git push origin ":refs/tags/$t" >/dev/null 2>&1 || true
+          done < <(git tag -l)
+
+          echo "✅ Fast cleanup completed."
+
+      - name: Fast Squash & Factory Reset
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          
+          git branch -D temp_clean_branch >/dev/null 2>&1 || true
+          git checkout --orphan temp_clean_branch
+          git add -A
+          
+          if git diff --cached --quiet; then
+            git commit --allow-empty -m "Ultra-fast Clean and Squash"
+          else
+            git commit -m "Ultra-fast Clean and Squash"
+          fi
+          
+          git branch -D "$DEFAULT_BRANCH" >/dev/null 2>&1 || true
+          git branch -m "$DEFAULT_BRANCH"
+          git push -f origin "$DEFAULT_BRANCH"
+          echo "🚀 ULTRA-FAST FACTORY RESET DONE!"
+
+      - name: Report Status
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "✅ SUCCESS!"
+          else
+            echo "❌ FAILED"
+            exit 1
+          fi
